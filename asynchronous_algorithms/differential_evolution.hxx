@@ -49,13 +49,25 @@ class DifferentialEvolution : public EvolutionaryAlgorithm {
         std::vector<double> MF;   // size H
         std::vector<double> MCR;  // size H
         uint32_t memory_index;    // cycles 0..H-1
-        uint32_t H;               // memory size
+        uint32_t H = 6;           // memory size
 
         std::vector<double> last_Fi;
         std::vector<double> last_CRi;
 
         uint32_t NP_init;   // initial population size
-        uint32_t NP_min;    // minimum population size
+        uint32_t NP_min = 4; // minimum active population size
+
+        // Slots never move: BOINC results carry these stable IDs. population_size
+        // is the active count; all per-slot vectors retain NP_init entries.
+        std::vector<uint32_t> active_ids; // sorted by stable ID
+        uint64_t reduction_interval = 10000; // reports per removal of five; 0 disables
+        uint64_t completed_evaluations = 0;
+
+        bool is_active(uint32_t id) const;
+        uint32_t random_active_id();
+        void reduce_population();
+        void active_fitness_statistics(double &best, double &mean,
+                                       double &median, double &worst) const;
 
         struct SuccessRecord {
           double Fi;

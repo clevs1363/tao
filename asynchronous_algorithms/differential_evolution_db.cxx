@@ -23,6 +23,9 @@
 #include <cstdlib>
 #include <limits>
 #include <iomanip>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
 
 #include "evolutionary_algorithm_db.hxx"
 #include "differential_evolution_db.hxx"
@@ -128,6 +131,9 @@ DifferentialEvolutionDB::create_tables(MYSQL *conn) throw (string) {
                 << "    `MCR` TEXT NOT NULL,"
                 << "    `last_Fi` TEXT NOT NULL,"
                 << "    `last_CRi` TEXT NOT NULL,"
+                << "    `reduction_interval` BIGINT UNSIGNED NOT NULL DEFAULT '10000',"
+                << "    `active_ids` TEXT NULL,"
+                << "    `completed_evaluations` BIGINT UNSIGNED NOT NULL DEFAULT '0',"
                 << "PRIMARY KEY (`id`),"
                 << "UNIQUE KEY `name` (`name`)"
                 << ") ENGINE=InnoDB AUTO_INCREMENT=0 DEFAULT CHARSET=latin1";
@@ -185,7 +191,16 @@ DifferentialEvolutionDB::construct_from_database(string query) throw (string) {
             throw ex_msg.str();
         }
 
-        construct_from_database(row);
+        if (mysql_num_fields(result) < 33) {
+            mysql_free_result(result);
+            throw string("Differential evolution schema requires migrations/001_de_population_reduction.sql");
+        }
+        try {
+            construct_from_database(row);
+        } catch (...) {
+            mysql_free_result(result);
+            throw;
+        }
         mysql_free_result(result);
     } else {
         ostringstream ex_msg;
@@ -233,14 +248,40 @@ DifferentialEvolutionDB::construct_from_database(MYSQL_ROW row) throw (string) {
     string_to_vector<double>(row[27], MCR);
     string_to_vector<double>(row[28], last_Fi);
     string_to_vector<double>(row[29], last_CRi);
+    reduction_interval = strtoull(row[30], NULL, 10);
+    completed_evaluations = strtoull(row[32], NULL, 10);
     if (H == 0) H = 6;
-    if (NP_min < 4) NP_min = 4;
-    if (NP_init < (uint32_t)population_size) NP_init = population_size;
+    if (NP_init == 0) NP_init = population_size;
+    if (population_size < 4 || NP_min < 4 || NP_min > population_size || NP_init < population_size)
+        throw string("Invalid differential evolution population sizes in database");
+    active_ids.clear();
+    if (row[31] == NULL) {
+        // Migration of an unreduced search: original slots are all active.
+        if (NP_init != population_size)
+            throw string("Cannot infer active IDs for an already compacted population");
+        active_ids.resize(NP_init);
+        iota(active_ids.begin(), active_ids.end(), 0);
+    } else {
+        vector<uint64_t> stored_ids;
+        string_to_vector<uint64_t>(row[31], stored_ids);
+        for (uint64_t slot : stored_ids) {
+            if (slot >= NP_init) throw string("Invalid active population ID in database");
+            active_ids.push_back(static_cast<uint32_t>(slot));
+        }
+    }
+    if (active_ids.size() != population_size ||
+        !is_sorted(active_ids.begin(), active_ids.end()) ||
+        adjacent_find(active_ids.begin(), active_ids.end()) != active_ids.end() ||
+        active_ids.back() >= NP_init)
+        throw string("Invalid active population IDs in database");
+    current_individual %= population_size;
     if (memory_index >= H) memory_index = 0;
     if (MF.size() != H) MF.assign(H, 0.5);
     if (MCR.size() != H) MCR.assign(H, 0.5);
-    if (last_Fi.size() != population_size) last_Fi.assign(population_size, 0.5);
-    if (last_CRi.size() != population_size) last_CRi.assign(population_size, 0.5);
+    if (last_Fi.size() != NP_init) last_Fi.assign(NP_init, 0.5);
+    if (last_CRi.size() != NP_init) last_CRi.assign(NP_init, 0.5);
+    quiet = true;
+    print_statistics = NULL;
     number_parameters = min_bound.size();
 
     //Get the individual information from the database
@@ -251,17 +292,17 @@ DifferentialEvolutionDB::construct_from_database(MYSQL_ROW row) throw (string) {
 
 //    cout << oss.str() << endl;
 
-    fitnesses.resize(population_size, -numeric_limits<double>::max());
-    population.resize(population_size, vector<double>(number_parameters, 0.0));
-    seeds.resize(population_size, 0);
+    fitnesses.resize(NP_init, -numeric_limits<double>::max());
+    population.resize(NP_init, vector<double>(number_parameters, 0.0));
+    seeds.resize(NP_init, 0);
 
-    EvolutionaryAlgorithm::initialize_rng();    //to initialize the random number generator
+    if (random_number_generator == NULL) EvolutionaryAlgorithm::initialize_rng();    //to initialize the random number generator
 
     if (result != NULL) {
         uint32_t num_results = mysql_num_rows(result);
-        if (num_results != population_size) {
+        if (num_results != NP_init) {
             ostringstream ex_msg;
-            ex_msg << "ERROR: got " << num_results << " results when looking up individuals for search " << name << ", with a population size: " << population_size << ". Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__;
+            ex_msg << "ERROR: got " << num_results << " results when looking up individuals for search " << name << ", with a slot count: " << NP_init << ". Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__;
             throw ex_msg.str();
         }   
 
@@ -269,6 +310,10 @@ DifferentialEvolutionDB::construct_from_database(MYSQL_ROW row) throw (string) {
 
         while ((individual_row = mysql_fetch_row(result))) {
             int individual_id = atoi(individual_row[0]);
+            if (individual_id < 0 || static_cast<uint32_t>(individual_id) >= NP_init) {
+                mysql_free_result(result);
+                throw string("Invalid differential evolution slot ID in database");
+            }
             fitnesses[individual_id] = atof(individual_row[1]);
 
             if (fitnesses[individual_id] < -1.79768e+308) {
@@ -293,8 +338,11 @@ DifferentialEvolutionDB::construct_from_database(MYSQL_ROW row) throw (string) {
     }
 
     //calculate global_best and global_best_fitness
+    global_best_id = active_ids.front();
     global_best_fitness = -numeric_limits<double>::max();
-    for (uint32_t i = 0; i < population.size(); i++) {
+    initialized_individuals = 0;
+    for (uint32_t i : active_ids) {
+        if (fitnesses[i] != -numeric_limits<double>::max()) ++initialized_individuals;
         if (global_best_fitness < fitnesses[i]) {
             global_best_id = i;
             global_best_fitness = fitnesses[i];
@@ -341,7 +389,10 @@ DifferentialEvolutionDB::insert_to_database() throw (string) {
           << ", MF = '" << vector_to_string<double>(MF) << "'"
           << ", MCR = '" << vector_to_string<double>(MCR) << "'"
           << ", last_Fi = '" << vector_to_string<double>(last_Fi) << "'"
-          << ", last_CRi = '" << vector_to_string<double>(last_CRi) << "'";
+          << ", last_CRi = '" << vector_to_string<double>(last_CRi) << "'"
+          << ", reduction_interval = " << reduction_interval
+          << ", active_ids = '" << vector_to_string<uint32_t>(active_ids) << "'"
+          << ", completed_evaluations = " << completed_evaluations;
 
     mysql_query(conn, query.str().c_str());
 
@@ -525,129 +576,121 @@ DifferentialEvolutionDB::~DifferentialEvolutionDB() {
 void
 DifferentialEvolutionDB::new_individual(uint32_t &id, vector<double> &parameters, uint32_t &seed) throw (string) {
     DifferentialEvolution::new_individual(id, parameters, seed);
+    generation_dirty = true;
 }
 
 void
 DifferentialEvolutionDB::new_individual(uint32_t &id, vector<double> &parameters) throw (string) {
     DifferentialEvolution::new_individual(id, parameters);
+    generation_dirty = true;
 }
 
 
 bool
 DifferentialEvolutionDB::insert_individual(uint32_t id, const vector<double> &parameters, double fitness, uint32_t seed) throw (string) {
 
-    bool modified = false;
+    if (vector_to_string<double>(parameters).length() >= 2048 || !std::isfinite(fitness))
+        return false;
+    // Synchronous DB callers generate and insert using the same object.
+    // Flush their generation cursor before reloading validator-owned state.
+    if (generation_dirty) update_current_individual();
+    if (mysql_query(conn, "START TRANSACTION")) throw string(mysql_error(conn));
+    try {
+        // Serialize validators and reload authoritative state. The generator may
+        // have run since this object was cached, or another validator may shrink.
+        ostringstream locked_search;
+        locked_search << "SELECT * FROM differential_evolution WHERE id = "
+                      << this->id << " FOR UPDATE";
+        construct_from_database(locked_search.str());
+        if (id >= population.size() || parameters.size() != number_parameters) {
+            if (mysql_query(conn, "COMMIT")) throw string(mysql_error(conn));
+            return false;
+        }
+        bool modified = DifferentialEvolution::insert_individual(id, parameters, fitness, seed);
 
-    // APPARENTLY the WU generator can just make WUs with the wrong bundle size
-    // if they're too big to place into the DB they'll crash things, so check that here
-    // if too big, ignore and don't add to the population
-    if (vector_to_string<double>(parameters).length() < 2048) {
+        if (modified) {
+            ostringstream individual_query;
+            individual_query << "UPDATE de_individual"
+                             << " SET "
+                             << "  fitness = " << setprecision(10) << fitnesses[id]
+                             << ", parameters = '" << vector_to_string<double>(population[id]) << "'"
+                             << ", seed = " << seeds[id]
+                             << " WHERE "
+                             << "     differential_evolution_id = " << this->id
+                             << " AND position = " << id;
 
-    modified = DifferentialEvolution::insert_individual(id, parameters, fitness);
+            mysql_query(conn, individual_query.str().c_str());
 
-    if (modified) {
-        ostringstream individual_query;
-        individual_query << "UPDATE de_individual"
-                         << " SET "
-                         << "  fitness = " << setprecision(10) << fitnesses[id]
-                         << ", parameters = '" << vector_to_string<double>(population[id]) << "'"
-                         << ", seed = " << seeds[id]
-                         << " WHERE "
-                         << "     differential_evolution_id = " << this->id
-                         << " AND position = " << id;
+            if (mysql_errno(conn) != 0) {
+                ostringstream ex_msg;
+                ex_msg << "ERROR: updating individual with query: '" << individual_query.str() << "'. Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__ << vector_to_string<double>(parameters) << vector_to_string<double>(parameters).length();
+                throw ex_msg.str();
+            }
 
-        mysql_query(conn, individual_query.str().c_str());
+            double best, average, median, worst;
+            active_fitness_statistics(best, average, median, worst);
 
-//        cout << individual_query.str() << endl;
+            ostringstream log_query;
+            log_query.precision(10);
+            log_query << "INSERT INTO differential_evolution_log"
+                << " SET "
+                << "  search_id = " << this->id
+                << ", evaluation = " << this->individuals_reported
+                << ", current = '" << setprecision(10) << fixed << fitnesses[id] << "'"
+                << ", best = '" << best << "'"
+                << ", average = '" << average << "'"
+                << ", median = '" << median << "'"
+                << ", worst = '" << worst << "'"
+                << ", individual = " << id
+                << ", seed = " << seed
+                << ", global = " << setprecision(10) << (fitnesses[id] == global_best_fitness);
 
-        if (mysql_errno(conn) != 0) {
-            ostringstream ex_msg;
-            ex_msg << "ERROR: updating individual with query: '" << individual_query.str() << "'. Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__ << vector_to_string<double>(parameters) << vector_to_string<double>(parameters).length();
-            throw ex_msg.str();
+            mysql_query(conn, log_query.str().c_str());
+
+            if (mysql_errno(conn) != 0) {
+                ostringstream ex_msg;
+                ex_msg << "ERROR: updating differential_evolution_log with query: '" << log_query.str() << "'. Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__;
+                throw ex_msg.str();
+            }
+
+
         }
 
-        ostringstream de_query;
-        de_query << " UPDATE differential_evolution"
-                 << " SET "
-//                 << "  current_individual = " << current_individual             //probably should not have this here TODO: fix this for standard_benchmarks_db
-                 << "  initialized_individuals = " << initialized_individuals
-                 << ", current_iteration = " << current_iteration
-                 << ", individuals_reported = " << individuals_reported
-                 << ", population_size = " << population_size
-                 << ", NP_init = " << NP_init
-                 << ", NP_min = " << NP_min
-                 << ", memory_index = " << memory_index
-                 << ", MF = '" << vector_to_string<double>(MF) << "'"
-                 << ", MCR = '" << vector_to_string<double>(MCR) << "'"
-                 << ", last_Fi = '" << vector_to_string<double>(last_Fi) << "'"
-                 << ", last_CRi = '" << vector_to_string<double>(last_CRi) << "'"
-                 << " WHERE "
-                 << "    id = " << this->id << endl;
-
-        mysql_query(conn, de_query.str().c_str());
-
-        if (mysql_errno(conn) != 0) {
-            ostringstream ex_msg;
-            ex_msg << "ERROR: updating differential_evolution with query: '" << individual_query.str() << "'. Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__;
-            throw ex_msg.str();
-        }
-
-
-        double best, average, median, worst;
-        calculate_fitness_statistics(fitnesses, best, average, median, worst);
-
-        ostringstream log_query;
-        log_query.precision(10);
-        log_query << "INSERT INTO differential_evolution_log"
-            << " SET "
-            << "  search_id = " << this->id
-            << ", evaluation = " << this->individuals_reported
-            << ", current = '" << setprecision(10) << fixed << fitnesses[id] << "'"
-            << ", best = '" << best << "'"
-            << ", average = '" << average << "'"
-            << ", median = '" << median << "'"
-            << ", worst = '" << worst << "'"
-            << ", individual = " << id
-            << ", seed = " << seed
-            << ", global = " << setprecision(10) << (fitnesses[id] == global_best_fitness);
-//            << ", parameters = '" << vector_to_string<double>(parameters) << "'" << endl;
-
-        mysql_query(conn, log_query.str().c_str());
-
-        if (mysql_errno(conn) != 0) {
-            ostringstream ex_msg;
-            ex_msg << "ERROR: updating differential_evolution_log with query: '" << log_query.str() << "'. Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__;
-            throw ex_msg.str();
-        }
-
-
+        // Validator-owned fields: persist even when fitness did not improve or
+        // the target slot was retired. Generation counters belong to the generator.
+        ostringstream state;
+        state << "UPDATE differential_evolution SET "
+              << "initialized_individuals = " << initialized_individuals
+              << ", individuals_reported = " << individuals_reported
+              << ", completed_evaluations = " << completed_evaluations
+              << ", population_size = " << population_size
+              << ", active_ids = '" << vector_to_string<uint32_t>(active_ids) << "'"
+              << ", memory_index = " << memory_index
+              << ", MF = '" << vector_to_string<double>(MF) << "'"
+              << ", MCR = '" << vector_to_string<double>(MCR) << "'"
+              << " WHERE id = " << this->id;
+        if (mysql_query(conn, state.str().c_str())) throw string(mysql_error(conn));
+        if (mysql_query(conn, "COMMIT")) throw string(mysql_error(conn));
+        return modified;
+    } catch (...) {
+        mysql_query(conn, "ROLLBACK");
+        // Pending adaptive successes may include the rolled-back evaluation.
+        success_pool.clear();
+        throw;
     }
-
-    if (population_size > 0 && (individuals_reported % population_size) == 0) {
-        update_current_individual();
-    }
-
-    }
-
-    return modified;
 }
+
 
 void
 DifferentialEvolutionDB::update_current_individual() throw (string) {
     ostringstream query;
     query << " UPDATE differential_evolution"
         << " SET "
+        // Only generator-owned fields. A stale generator must not undo a
+        // validator's active set, report count, or adaptive memory updates.
         << "  current_individual = " << current_individual
-        << ", initialized_individuals = " << initialized_individuals
-        << ", current_iteration = " << current_iteration
-        << ", individuals_created = " << individuals_created
-        << ", individuals_reported = " << individuals_reported
-        << ", population_size = " << population_size
-        << ", NP_init = " << NP_init
-        << ", NP_min = " << NP_min
-        << ", memory_index = " << memory_index
-        << ", MF = '" << vector_to_string<double>(MF) << "'"
-        << ", MCR = '" << vector_to_string<double>(MCR) << "'"
+        << ", current_iteration = GREATEST(current_iteration, " << current_iteration << ")"
+        << ", individuals_created = GREATEST(individuals_created, " << individuals_created << ")"
         << ", last_Fi = '" << vector_to_string<double>(last_Fi) << "'"
         << ", last_CRi = '" << vector_to_string<double>(last_CRi) << "'"
         << " WHERE "
@@ -660,6 +703,7 @@ DifferentialEvolutionDB::update_current_individual() throw (string) {
         ex_msg << "ERROR: updating 'differential_evolution' with query: '" << query.str() << "'. Error: " << mysql_errno(conn) << " -- '" << mysql_error(conn) << "'. Thrown on " << __FILE__ << ":" << __LINE__;
         throw ex_msg.str();
     }   
+    generation_dirty = false;
 }
 
 void
@@ -752,7 +796,7 @@ DifferentialEvolutionDB::print_to(ostream& stream) {
             << "    app_id = " << app_id << endl
             << "]" << endl;
 
-    for (uint32_t i = 0; i < population_size; i++) {
+    for (uint32_t i : active_ids) {
         stream << "    [DEIndividual" << endl
                << "        differential_evolution_id = " << id << endl
                << "        position = " << i << endl

@@ -36,6 +36,7 @@ class DifferentialEvolutionDB : public DifferentialEvolution, public Evolutionar
 //        std::string name;
 
         MYSQL *conn;
+        bool generation_dirty = false;
 
         void check_name(std::string name) throw (std::string);
     public:
